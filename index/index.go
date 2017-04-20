@@ -1,52 +1,58 @@
 package index
 
 import (
-	"regexp"
 	"strings"
 
 	"github.com/hashicorp/hcl"
-	"github.com/hashicorp/hcl/hcl/ast"
-	"github.com/hashicorp/hcl/hcl/parser"
-	"github.com/hashicorp/hcl/hcl/token"
+	hclast "github.com/hashicorp/hcl/hcl/ast"
+	hclparser "github.com/hashicorp/hcl/hcl/parser"
+	hcltoken "github.com/hashicorp/hcl/hcl/token"
+	"github.com/hashicorp/hil"
+	hilast "github.com/hashicorp/hil/ast"
+	hilparser "github.com/hashicorp/hil/parser"
 )
 
 type VariableDeclaration struct {
 	Name     string
-	Location token.Pos
+	Location hcltoken.Pos
 }
 
 type ResourceDeclaration struct {
 	Type     string
 	Name     string
-	Location token.Pos
+	Location hcltoken.Pos
 }
 
 type OutputDeclaration struct {
 	Name     string
-	Location token.Pos
+	Location hcltoken.Pos
 }
 
 type ReferenceList struct {
 	Name      string
-	Locations []token.Pos
+	Locations []hcltoken.Pos
 }
 
 type Error struct {
 	Message  string
-	Location token.Pos
+	Location hcltoken.Pos
 }
 
 type Index struct {
+	Version    string
 	Errors     []Error
 	Variables  []VariableDeclaration
 	Resources  []ResourceDeclaration
 	Outputs    []OutputDeclaration
 	References map[string]ReferenceList
-	RawAst     *ast.File
+	RawAst     *hclast.File
 }
+
+const INDEX_VERSION = "1.0.0"
 
 func NewIndex() *Index {
 	index := new(Index)
+	index.Version = INDEX_VERSION
 	index.Errors = []Error{}
 	index.Variables = []VariableDeclaration{}
 	index.Resources = []ResourceDeclaration{}
@@ -56,18 +62,18 @@ func NewIndex() *Index {
 	return index
 }
 
-func (index *Index) Collect(astFile *ast.File, path string, includeRaw bool) error {
-	ast.Walk(astFile.Node, func(current ast.Node) (ast.Node, bool) {
+func (index *Index) Collect(astFile *hclast.File, path string, includeRaw bool) error {
+	hclast.Walk(astFile.Node, func(current hclast.Node) (hclast.Node, bool) {
 		switch current.(type) {
-		case *ast.ObjectList:
+		case *hclast.ObjectList:
 			{
-				index.handleObjectList(current.(*ast.ObjectList), path)
+				index.handleObjectList(current.(*hclast.ObjectList), path)
 				break
 			}
 
-		case *ast.LiteralType:
+		case *hclast.LiteralType:
 			{
-				index.handleLiteral(current.(*ast.LiteralType), path)
+				index.handleLiteral(current.(*hclast.LiteralType), path)
 				break
 			}
 		}
@@ -92,7 +98,7 @@ func (index *Index) CollectString(contents []byte, path string, includeRaw bool)
 }
 
 func makeError(err error, path string) Error {
-	if posError, ok := err.(*parser.PosError); ok {
+	if posError, ok := err.(*hclparser.PosError); ok {
 		return Error{
 			Message:  posError.Err.Error(),
 			Location: posError.Pos,
@@ -104,17 +110,17 @@ func makeError(err error, path string) Error {
 	}
 }
 
-func getText(t token.Token) string {
+func getText(t hcltoken.Token) string {
 	return strings.Trim(t.Text, "\"")
 }
 
-func getPos(t token.Token, path string) token.Pos {
+func getPos(t hcltoken.Token, path string) hcltoken.Pos {
 	location := t.Pos
 	location.Filename = path
 	return location
 }
 
-func (index *Index) handleObjectList(objectList *ast.ObjectList, path string) {
+func (index *Index) handleObjectList(objectList *hclast.ObjectList, path string) {
 	for _, item := range objectList.Items {
 		firstToken := item.Keys[0].Token
 		if firstToken.Type != 4 {
@@ -156,7 +162,7 @@ func (index *Index) handleObjectList(objectList *ast.ObjectList, path string) {
 	}
 }
 
-func literalSubPos(text string, pos token.Pos, start int, path string) token.Pos {
+func literalSubPos(text string, pos hcltoken.Pos, start int, path string) hcltoken.Pos {
 	for index, char := range text {
 		if index == start {
 			break
@@ -176,32 +182,60 @@ func literalSubPos(text string, pos token.Pos, start int, path string) token.Pos
 	return pos
 }
 
-func (index *Index) handleLiteral(literal *ast.LiteralType, path string) {
-	re := regexp.MustCompile(`\${(var\..*?)}`)
+func toHilPos(pos hcltoken.Pos) hilast.Pos {
+	return hilast.Pos{
+		Column:   pos.Column,
+		Line:     pos.Line,
+		Filename: pos.Filename,
+	}
+}
 
-	matches := re.FindAllStringIndex(literal.Token.Text, -1)
-	if matches == nil {
+func toHclPos(pos hilast.Pos) hcltoken.Pos {
+	return hcltoken.Pos{
+		Column:   pos.Column,
+		Line:     pos.Line,
+		Filename: pos.Filename,
+		Offset:   0,
+	}
+}
+
+func (index *Index) addReference(name string, pos hcltoken.Pos) {
+	list := index.References[name]
+	list.Locations = append(list.Locations, pos)
+	index.References[name] = list
+}
+
+func (index *Index) handleLiteral(literal *hclast.LiteralType, path string) {
+	root, err := hil.ParseWithPosition(literal.Token.Text, toHilPos(literal.Token.Pos))
+	if err != nil {
+		if parseError, ok := err.(*hilparser.ParseError); ok {
+			index.Errors = append(index.Errors, Error{
+				Message:  parseError.Message,
+				Location: toHclPos(parseError.Pos),
+			})
+		} else {
+			index.Errors = append(index.Errors, Error{
+				Message:  err.Error(),
+				Location: literal.Token.Pos,
+			})
+		}
 		return
 	}
 
-	for _, match := range matches {
-		start := match[0] + 2 // ${
-		end := match[1] - 1   // }
-		name := literal.Token.Text[start+4 : end]
+	root.Accept(func(node hilast.Node) hilast.Node {
+		switch node.(type) {
+		case *hilast.VariableAccess:
+			{
+				variable := node.(*hilast.VariableAccess)
+				// for now ONLY index variables:
+				if !strings.HasPrefix(variable.Name, "var.") {
+					break
+				}
 
-		pos := literalSubPos(literal.Token.Text, literal.Pos(), start, path)
-
-		_, ok := index.References[name]
-		if !ok {
-			list := ReferenceList{
-				Name:      name,
-				Locations: []token.Pos{pos},
+				index.addReference(variable.Name, toHclPos(variable.Pos()))
+				break
 			}
-			index.References[name] = list
-		} else {
-			list := index.References[name]
-			list.Locations = append(list.Locations, pos)
-			index.References[name] = list
 		}
-	}
+		return node
+	})
 }
