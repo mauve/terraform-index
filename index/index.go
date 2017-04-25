@@ -1,7 +1,12 @@
 package index
 
 import (
+	"errors"
 	"strings"
+
+	"fmt"
+
+	"os"
 
 	"github.com/hashicorp/hcl"
 	hclast "github.com/hashicorp/hcl/hcl/ast"
@@ -12,24 +17,23 @@ import (
 	hilparser "github.com/hashicorp/hil/parser"
 )
 
-type VariableDeclaration struct {
-	Name     string
-	Location hcltoken.Pos
+type UntypedSection struct {
+	Name          string
+	Location      hcltoken.Pos
+	Documentation []string
 }
 
-type ResourceDeclaration struct {
-	Type     string
-	Name     string
-	Location hcltoken.Pos
-}
-
-type OutputDeclaration struct {
-	Name     string
-	Location hcltoken.Pos
+type TypedSection struct {
+	Type          string
+	Name          string
+	Location      hcltoken.Pos
+	Documentation []string
 }
 
 type ReferenceList struct {
 	Name      string
+	Type      string
+	Path      string
 	Locations []hcltoken.Pos
 }
 
@@ -39,25 +43,34 @@ type Error struct {
 }
 
 type Index struct {
-	Version    string
-	Errors     []Error
-	Variables  []VariableDeclaration
-	Resources  []ResourceDeclaration
-	Outputs    []OutputDeclaration
-	References map[string]ReferenceList
-	RawAst     *hclast.File
+	Version          string
+	Errors           []Error
+	Variables        []UntypedSection
+	DefaultProviders []UntypedSection
+	Providers        []TypedSection
+	Resources        []TypedSection
+	DataResources    []TypedSection
+	Modules          []UntypedSection
+	Outputs          []UntypedSection
+	References       map[string]ReferenceList
+	RawAst           *hclast.File
 }
 
-const INDEX_VERSION = "1.0.0"
+const INDEX_VERSION = "1.2.0"
 
 func NewIndex() *Index {
 	index := new(Index)
 	index.Version = INDEX_VERSION
 	index.Errors = []Error{}
-	index.Variables = []VariableDeclaration{}
-	index.Resources = []ResourceDeclaration{}
-	index.Outputs = []OutputDeclaration{}
+	index.Variables = []UntypedSection{}
+	index.DefaultProviders = []UntypedSection{}
+	index.Providers = []TypedSection{}
+	index.Resources = []TypedSection{}
+	index.DataResources = []TypedSection{}
+	index.Modules = []UntypedSection{}
+	index.Outputs = []UntypedSection{}
 	index.References = map[string]ReferenceList{}
+
 	index.RawAst = nil
 	return index
 }
@@ -66,16 +79,10 @@ func (index *Index) Collect(astFile *hclast.File, path string, includeRaw bool) 
 	hclast.Walk(astFile.Node, func(current hclast.Node) (hclast.Node, bool) {
 		switch current.(type) {
 		case *hclast.ObjectList:
-			{
-				index.handleObjectList(current.(*hclast.ObjectList), path)
-				break
-			}
+			index.handleObjectList(current.(*hclast.ObjectList), path)
 
 		case *hclast.LiteralType:
-			{
-				index.handleLiteral(current.(*hclast.LiteralType), path)
-				break
-			}
+			index.handleLiteral(current.(*hclast.LiteralType), path)
 		}
 
 		return current, true
@@ -95,6 +102,10 @@ func (index *Index) CollectString(contents []byte, path string, includeRaw bool)
 	}
 
 	return index.Collect(astFile, path, includeRaw)
+}
+
+func warning(line, column int, message string) {
+	fmt.Fprintf(os.Stderr, "[WARN] %d:%d: %s\n", line, column, message)
 }
 
 func makeError(err error, path string) Error {
@@ -120,8 +131,124 @@ func getPos(t hcltoken.Token, path string) hcltoken.Pos {
 	return location
 }
 
+func commentGroup(group *hclast.CommentGroup) []string {
+	comments := []string{}
+
+	if group == nil {
+		return comments
+	}
+
+	for _, comment := range group.List {
+		if comment.Text != "" {
+			comments = append(comments, comment.Text)
+		}
+	}
+	return comments
+}
+
+func (index *Index) extractResourceDeclaration(item *hclast.ObjectItem, path string) {
+	resource := TypedSection{
+		Name:          getText(item.Keys[2].Token),
+		Type:          getText(item.Keys[1].Token),
+		Location:      getPos(item.Keys[2].Token, path), // return position of name
+		Documentation: commentGroup(item.LeadComment),
+	}
+	index.Resources = append(index.Resources, resource)
+}
+
+func (index *Index) extractDataDeclaration(item *hclast.ObjectItem, path string) {
+	resource := TypedSection{
+		Name:          getText(item.Keys[2].Token),
+		Type:          getText(item.Keys[1].Token),
+		Location:      getPos(item.Keys[2].Token, path), // return position of name
+		Documentation: commentGroup(item.LeadComment),
+	}
+	index.DataResources = append(index.DataResources, resource)
+}
+
+func (index *Index) extractVariableDeclaration(item *hclast.ObjectItem, path string) {
+	variable := UntypedSection{
+		Name:          getText(item.Keys[1].Token),
+		Location:      getPos(item.Keys[1].Token, path),
+		Documentation: commentGroup(item.LeadComment),
+	}
+	index.Variables = append(index.Variables, variable)
+}
+
+func (index *Index) extractOutputDeclaration(item *hclast.ObjectItem, path string) {
+	output := UntypedSection{
+		Name:          getText(item.Keys[1].Token),
+		Location:      getPos(item.Keys[1].Token, path),
+		Documentation: commentGroup(item.LeadComment),
+	}
+	index.Outputs = append(index.Outputs, output)
+}
+
+func (index *Index) extractProviderDeclaration(item *hclast.ObjectItem, path string) {
+	// if alias property exists, store as named provider
+	alias, err := extractPropertyValue(item, "alias")
+	if err != nil {
+		provider := UntypedSection{
+			Name:          getText(item.Keys[0].Token),
+			Location:      getPos(item.Keys[0].Token, path),
+			Documentation: commentGroup(item.LeadComment),
+		}
+		index.DefaultProviders = append(index.DefaultProviders, provider)
+	} else {
+		provider := TypedSection{
+			Name:          alias,
+			Location:      getPos(item.Keys[1].Token, path),
+			Type:          getText(item.Keys[1].Token),
+			Documentation: commentGroup(item.LeadComment),
+		}
+		index.Providers = append(index.Providers, provider)
+	}
+}
+
+func (index *Index) extractModuleDeclaration(item *hclast.ObjectItem, path string) {
+	module := UntypedSection{
+		Name:          getText(item.Keys[1].Token),
+		Location:      getPos(item.Keys[1].Token, path),
+		Documentation: commentGroup(item.LeadComment),
+	}
+	index.Modules = append(index.Modules, module)
+}
+
+func extractPropertyValue(item *hclast.ObjectItem, property string) (string, error) {
+	if item.Val == nil {
+		return "", errors.New("Cannot extract property")
+	}
+
+	object, ok := item.Val.(*hclast.ObjectType)
+	if !ok {
+		return "", errors.New("Cannot extract property")
+	}
+
+	for _, item := range object.List.Items {
+		if len(item.Keys) == 0 {
+			continue
+		}
+
+		text := getText(item.Keys[0].Token)
+		if text != property {
+			continue
+		}
+
+		if value, ok := item.Val.(*hclast.LiteralType); ok {
+			return getText(value.Token), nil
+		}
+	}
+
+	return "", errors.New("Cannot extract property")
+}
+
 func (index *Index) handleObjectList(objectList *hclast.ObjectList, path string) {
 	for _, item := range objectList.Items {
+		if len(item.Keys) == 0 {
+			warning(item.Pos().Line, item.Pos().Column, fmt.Sprintf("Ignoring token with empty 'Keys[]"))
+			continue
+		}
+
 		firstToken := item.Keys[0].Token
 		if firstToken.Type != 4 {
 			continue
@@ -129,57 +256,19 @@ func (index *Index) handleObjectList(objectList *hclast.ObjectList, path string)
 
 		switch firstToken.Text {
 		case "variable":
-			{
-				variable := VariableDeclaration{
-					Name:     getText(item.Keys[1].Token),
-					Location: getPos(item.Keys[1].Token, path),
-				}
-				index.Variables = append(index.Variables, variable)
-				break
-			}
-
+			index.extractVariableDeclaration(item, path)
 		case "resource":
-			{
-				resource := ResourceDeclaration{
-					Name:     getText(item.Keys[2].Token),
-					Type:     getText(item.Keys[1].Token),
-					Location: getPos(item.Keys[2].Token, path), // return position of name
-				}
-				index.Resources = append(index.Resources, resource)
-				break
-			}
-
+			index.extractResourceDeclaration(item, path)
+		case "data":
+			index.extractDataDeclaration(item, path)
+		case "provider":
+			index.extractProviderDeclaration(item, path)
+		case "module":
+			index.extractModuleDeclaration(item, path)
 		case "output":
-			{
-				output := OutputDeclaration{
-					Name:     getText(item.Keys[1].Token),
-					Location: getPos(item.Keys[1].Token, path),
-				}
-				index.Outputs = append(index.Outputs, output)
-				break
-			}
+			index.extractOutputDeclaration(item, path)
 		}
 	}
-}
-
-func literalSubPos(text string, pos hcltoken.Pos, start int, path string) hcltoken.Pos {
-	for index, char := range text {
-		if index == start {
-			break
-		}
-
-		if char == '\n' {
-			pos.Column = 1
-			pos.Line++
-		} else {
-			pos.Column++
-		}
-
-		pos.Offset++
-	}
-
-	pos.Filename = path
-	return pos
 }
 
 func toHilPos(pos hcltoken.Pos) hilast.Pos {
@@ -199,8 +288,31 @@ func toHclPos(pos hilast.Pos) hcltoken.Pos {
 	}
 }
 
-func (index *Index) addReference(name string, pos hcltoken.Pos) {
+func toHclPosWithPath(pos hilast.Pos, path string) hcltoken.Pos {
+	result := toHclPos(pos)
+	result.Filename = path
+	return result
+}
+
+func (index *Index) addReference(reference string, pos hcltoken.Pos) {
+	parts := strings.SplitN(reference, ".", 3)
+
+	if len(parts) < 2 {
+		warning(pos.Line, pos.Column, fmt.Sprintf("Cannot understand reference %s: ", reference))
+		return
+	}
+
+	name := parts[1]
 	list := index.References[name]
+	list.Name = name
+	if parts[0] == "var" {
+		list.Type = "variable"
+	} else {
+		list.Type = parts[0]
+	}
+	if len(parts) > 2 {
+		list.Path = parts[2]
+	}
 	list.Locations = append(list.Locations, pos)
 	index.References[name] = list
 }
@@ -227,12 +339,8 @@ func (index *Index) handleLiteral(literal *hclast.LiteralType, path string) {
 		case *hilast.VariableAccess:
 			{
 				variable := node.(*hilast.VariableAccess)
-				// for now ONLY index variables:
-				if !strings.HasPrefix(variable.Name, "var.") {
-					break
-				}
 
-				index.addReference(variable.Name, toHclPos(variable.Pos()))
+				index.addReference(variable.Name, toHclPosWithPath(variable.Pos(), path))
 				break
 			}
 		}

@@ -1,0 +1,3 @@
+provider "smurf" {
+  property = "A"
+}
