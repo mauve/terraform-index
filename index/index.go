@@ -196,26 +196,6 @@ func (index *Index) handleObjectList(objectList *hclast.ObjectList, path string)
 	}
 }
 
-func literalSubPos(text string, pos hcltoken.Pos, start int, path string) hcltoken.Pos {
-	for index, char := range text {
-		if index == start {
-			break
-		}
-
-		if char == '\n' {
-			pos.Column = 1
-			pos.Line++
-		} else {
-			pos.Column++
-		}
-
-		pos.Offset++
-	}
-
-	pos.Filename = path
-	return pos
-}
-
 func toHilPos(pos hcltoken.Pos) hilast.Pos {
 	return hilast.Pos{
 		Column:   pos.Column,
