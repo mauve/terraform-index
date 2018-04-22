@@ -13,6 +13,7 @@ import (
 )
 
 type VariableDeclaration struct {
+	Type     string
 	Name     string
 	Location hcltoken.Pos
 }
@@ -48,7 +49,7 @@ type Index struct {
 	RawAst     *hclast.File
 }
 
-const INDEX_VERSION = "1.0.0"
+const INDEX_VERSION = "1.1.0"
 
 func NewIndex() *Index {
 	index := new(Index)
@@ -120,6 +121,38 @@ func getPos(t hcltoken.Token, path string) hcltoken.Pos {
 	return location
 }
 
+func getVariableType(val *hclast.Node) string {
+	varType := "undeclared"
+
+	hclast.Walk(*val, func(current hclast.Node) (hclast.Node, bool) {
+		switch current.(type) {
+		case *hclast.ObjectList:
+			for _, item := range current.(*hclast.ObjectList).Items {
+				firstToken := item.Keys[0].Token
+				switch {
+				case firstToken.Type != 4:
+					{
+						continue
+					}
+				case firstToken.Text != "type":
+					{
+						continue
+					}
+				}
+				hclast.Walk(item.Val, func(typeNode hclast.Node) (hclast.Node, bool) {
+					switch typeNode.(type) {
+					case *hclast.LiteralType:
+						varType = getText(typeNode.(*hclast.LiteralType).Token)
+					}
+					return typeNode, true
+				})
+			}
+		}
+		return current, true
+	})
+	return varType
+}
+
 func (index *Index) handleObjectList(objectList *hclast.ObjectList, path string) {
 	for _, item := range objectList.Items {
 		firstToken := item.Keys[0].Token
@@ -131,6 +164,7 @@ func (index *Index) handleObjectList(objectList *hclast.ObjectList, path string)
 		case "variable":
 			{
 				variable := VariableDeclaration{
+					Type:     getVariableType(&item.Val),
 					Name:     getText(item.Keys[1].Token),
 					Location: getPos(item.Keys[1].Token, path),
 				}
@@ -160,26 +194,6 @@ func (index *Index) handleObjectList(objectList *hclast.ObjectList, path string)
 			}
 		}
 	}
-}
-
-func literalSubPos(text string, pos hcltoken.Pos, start int, path string) hcltoken.Pos {
-	for index, char := range text {
-		if index == start {
-			break
-		}
-
-		if char == '\n' {
-			pos.Column = 1
-			pos.Line++
-		} else {
-			pos.Column++
-		}
-
-		pos.Offset++
-	}
-
-	pos.Filename = path
-	return pos
 }
 
 func toHilPos(pos hcltoken.Pos) hilast.Pos {
